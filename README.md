@@ -71,6 +71,8 @@ pip install -e ".[dev]"
 make test           # includes the no-lookahead guard
 python run_demo.py  # graph, features, and network surfacing
 python run_model.py # train, evaluate honestly, and print the account queue
+python scripts/run_investigation.py  # analyst SQL over the transactions (DuckDB)
+python scripts/make_figures.py       # value-vs-budget and per-typology recall
 ```
 
 Data download instructions are in [`data/aml/README.md`](data/aml/README.md). Raw CSVs
