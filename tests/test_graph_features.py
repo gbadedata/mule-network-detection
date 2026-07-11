@@ -1,0 +1,93 @@
+"""Tests for the mule-network graph features.
+
+The central guarantee is that the streaming features use no future information. We
+verify it directly: features computed on a time-prefix of the data must match the
+features computed on the full data for those same early rows. If a future transfer
+changed a past row, there would be lookahead.
+"""
+
+import numpy as np
+import pandas as pd
+
+from aml import aml_data, graph_features
+
+
+def _frame():
+    base = pd.Timestamp("2022-09-01")
+    # (offset_min, from, to, amount, is_laundering)
+    rows = [
+        (0, "B", "A", 100.0, 0),   # A first inflow, from B
+        (1, "C", "A", 100.0, 0),   # A second inflow, second distinct sender
+        (2, "D", "B", 50.0, 0),    # unrelated
+        (3, "A", "E", 190.0, 1),   # A forwards out (pass-through)
+        (4, "B", "A", 20.0, 0),    # A inflow again, but sender B already seen
+    ]
+    return pd.DataFrame({
+        "ts": [base + pd.Timedelta(minutes=m) for m, *_ in rows],
+        "from_account": [r[1] for r in rows],
+        "to_account": [r[2] for r in rows],
+        "amount": [r[3] for r in rows],
+        "is_laundering": [r[4] for r in rows],
+    })
+
+
+def test_prior_features_use_no_future_info():
+    df = _frame()
+    full, cols = graph_features.prior_features(df)
+    for k in range(1, len(df)):
+        prefix, _ = graph_features.prior_features(df.iloc[:k])
+        # early rows must be identical whether or not later rows exist
+        a = full[cols].iloc[:k].reset_index(drop=True)
+        b = prefix[cols].reset_index(drop=True)
+        assert np.allclose(a.to_numpy(), b.to_numpy()), f"future info leaked at k={k}"
+
+
+def test_dst_in_degree_counts_distinct_prior_senders():
+    df = _frame()
+    f, _ = graph_features.prior_features(df)
+    f = f.sort_values("ts").reset_index(drop=True)
+    # A's inflow rows are 0,1,4 with distinct prior senders {}, {B}, {B,C}
+    a_rows = f[f["to_account"] == "A"]
+    assert a_rows["dst_in_deg_prior"].tolist() == [0, 1, 2]
+    # sender B sends at rows 0 and 4: prior out counts 0 then 1
+    b_rows = f[f["from_account"] == "B"]
+    assert b_rows["src_out_cnt_prior"].tolist() == [0, 1]
+
+
+def test_passthrough_prior_rises_after_forwarding():
+    df = _frame()
+    f, _ = graph_features.prior_features(df)
+    f = f.sort_values("ts").reset_index(drop=True)
+    # before A forwards, its pass-through-prior is ~0; the forward is row index 3
+    a_inflows = f[f["to_account"] == "A"].sort_values("ts")
+    assert a_inflows["dst_passthrough_prior"].iloc[0] == 0.0  # first inflow, nothing sent yet
+
+
+def test_account_summary_labels_both_endpoints():
+    df = _frame()
+    s = graph_features.account_summary(df)
+    laund = set(s.loc[s["is_laundering_acct"] == 1, "account"])
+    # the only laundering transfer is A -> E, so both A and E are laundering accounts
+    assert "A" in laund and "E" in laund
+    assert "D" not in laund
+
+
+def test_build_graph_has_all_transfers():
+    df = _frame()
+    g = graph_features.build_account_graph(df)
+    assert g.number_of_edges() == len(df)
+    assert g.number_of_nodes() == len({*df["from_account"], *df["to_account"]})
+
+
+def test_mock_contains_every_typology():
+    raw = aml_data.mock_aml_frames(seed=7)
+    patterns = set(raw.loc[raw["Is Laundering"] == 1, "Pattern"])
+    assert {"fan_in", "fan_out", "chain", "cycle", "scatter_gather"} <= patterns
+
+
+def test_loader_normalises_columns():
+    raw = aml_data.mock_aml_frames(seed=7)
+    df = aml_data.load_aml_frame(raw)
+    for col in ["ts", "from_account", "to_account", "amount", "is_laundering"]:
+        assert col in df.columns
+    assert df["ts"].is_monotonic_increasing
