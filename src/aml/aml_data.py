@@ -182,3 +182,58 @@ def write_mock_aml(out_dir: str | Path, **kwargs) -> Path:
     path = out / "mock_Trans.csv"
     mock_aml_frames(**kwargs).drop(columns=["Pattern"]).to_csv(path, index=False)
     return path
+
+
+# ------------------------------------------------------------------- patterns file
+
+def _bank_account(bank: str, account: str) -> str:
+    """Bank-prefixed account key, matching how the loader parses the Trans CSV.
+
+    Banks are all-numeric and pandas reads them as integers in the Trans CSV, dropping
+    leading zeros, so we convert the same way here or the join would miss.
+    """
+    bank = bank.strip()
+    try:
+        bank = str(int(bank))
+    except ValueError:
+        pass
+    return f"{bank}-{account.strip()}"
+
+
+def load_patterns(path: str | Path) -> pd.DataFrame:
+    """Parse HI-Small_Patterns.txt into labelled laundering transfers.
+
+    The file is blocks delimited by `BEGIN LAUNDERING ATTEMPT - <TYPOLOGY>` and
+    `END LAUNDERING ATTEMPT`, with transaction rows in the raw Trans format. Returns the
+    join key (ts, from_account, to_account, amount) plus the normalised typology name.
+    """
+    import re
+
+    typ = None
+    rows = []
+    with open(path) as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if line.startswith("BEGIN LAUNDERING ATTEMPT"):
+                m = re.search(r"ATTEMPT\s*-\s*([A-Z][A-Z-]*)", line)
+                typ = m.group(1).lower().replace("-", "_") if m else "unknown"
+            elif line.startswith("END LAUNDERING ATTEMPT"):
+                typ = None
+            elif typ and line.count(",") >= 10:
+                p = line.split(",")
+                rows.append((pd.to_datetime(p[0]), _bank_account(p[1], p[2]),
+                             _bank_account(p[3], p[4]), round(float(p[7]), 2), typ))
+    return pd.DataFrame(rows, columns=["ts", "from_account", "to_account", "amount", "pattern"])
+
+
+def attach_patterns(df: pd.DataFrame, patterns: pd.DataFrame) -> pd.DataFrame:
+    """Add a `pattern` column to df by joining labelled laundering transfers.
+
+    Non-laundering transfers, and any laundering transfer not covered by a pattern
+    block, get an empty pattern.
+    """
+    key = ["ts", "from_account", "to_account", "amount"]
+    p = patterns.drop_duplicates(key)[key + ["pattern"]]
+    out = df.merge(p, on=key, how="left")
+    out["pattern"] = out["pattern"].fillna("")
+    return out

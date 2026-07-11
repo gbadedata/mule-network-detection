@@ -32,7 +32,11 @@ RAND_C = "#b0b0b0"
 def load():
     real = Path("data/aml/HI-Small_Trans.csv")
     if real.exists():
-        return aml_data.load_aml(real), "real IBM-AML"
+        df = aml_data.load_aml(real)
+        pat = Path("data/aml/HI-Small_Patterns.txt")
+        if pat.exists():
+            df = aml_data.attach_patterns(df, aml_data.load_patterns(pat))
+        return df, "real IBM-AML"
     return aml_data.load_aml_frame(aml_data.mock_aml_frames(seed=7)), "mock (illustrative)"
 
 

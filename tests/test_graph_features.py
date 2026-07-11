@@ -109,6 +109,40 @@ def test_in_burst_counts_recent_arrivals():
     assert f["dst_in_burst"].tolist() == [0, 1, 2]
 
 
+def test_patterns_parse_and_join_handles_bank_zeros(tmp_path):
+    # patterns file with leading-zero banks, in the real block format
+    text = (
+        "BEGIN LAUNDERING ATTEMPT - FAN-OUT:  Max 3-degree Fan-Out\n"
+        "2022/09/01 00:06,021174,800737690,012,80011F990,2848.96,Euro,2848.96,Euro,ACH,1\n"
+        "2022/09/01 04:33,021174,800737690,020,80020C5B0,8630.40,Euro,8630.40,Euro,ACH,1\n"
+        "END LAUNDERING ATTEMPT - FAN-OUT\n"
+        "BEGIN LAUNDERING ATTEMPT - CYCLE:  Max 2 hops\n"
+        "2022/09/02 08:44,0217,80FD27570,0024856,8090E8EB0,10621.24,Shekel,10621.24,Shekel,ACH,1\n"
+        "END LAUNDERING ATTEMPT - CYCLE\n"
+    )
+    pf = tmp_path / "patterns.txt"
+    pf.write_text(text)
+    pats = aml_data.load_patterns(pf)
+    assert set(pats["pattern"]) == {"fan_out", "cycle"}
+    # bank 021174 must normalise to 21174 to match pandas int parsing of the Trans CSV
+    assert (pats["from_account"] == "21174-800737690").sum() == 2
+
+    # a Trans-shaped frame where those transfers exist should get labelled
+    raw = aml_data.mock_aml_frames(n_accounts=300, n_legit=500, n_fan_in=2, n_fan_out=2,
+                                   n_chains=2, n_cycles=2, n_scatter_gather=1, seed=5)
+    df = aml_data.load_aml_frame(raw).drop(columns=["pattern"])
+    # inject one of the pattern transfers so the join has a hit
+    import pandas as pd
+    row = {"ts": pd.Timestamp("2022/09/01 00:06"), "from_bank": "21174",
+           "from_account": "21174-800737690", "to_bank": "12",
+           "to_account": "12-80011F990", "amount_paid": 2848.96, "amount_received": 2848.96,
+           "payment_currency": "Euro", "receiving_currency": "Euro", "payment_format": "ACH",
+           "is_laundering": 1, "amount": 2848.96}
+    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    out = aml_data.attach_patterns(df, pats)
+    assert (out["pattern"] == "fan_out").sum() == 1
+
+
 def test_burst_flags_catch_fan_in_and_fan_out_hubs():
     df = aml_data.load_aml_frame(aml_data.mock_aml_frames(seed=7))
     s = graph_features.structural_flags(df)

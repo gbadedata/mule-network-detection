@@ -48,8 +48,11 @@ def per_typology_recall(df: pd.DataFrame, scores: np.ndarray, budget: int,
     order = np.argsort(-scores)
     flagged = np.zeros(len(scores), dtype=bool)
     flagged[order[:budget]] = True
-    ld = df[df[label_col] == 1]
-    fl = flagged[df[label_col].to_numpy() == 1]
+    mask = (df[label_col].to_numpy() == 1) & (df[pattern_col].astype(str).to_numpy() != "")
+    ld = df[mask]
+    if ld.empty:
+        return pd.DataFrame()
+    fl = flagged[mask]
     out = (pd.DataFrame({"pattern": ld[pattern_col].to_numpy(), "flagged": fl})
            .groupby("pattern")["flagged"].agg(["sum", "count"]))
     out["recall"] = out["sum"] / out["count"]

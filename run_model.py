@@ -21,7 +21,13 @@ def load() -> pd.DataFrame:
     real = Path("data/aml/HI-Small_Trans.csv")
     if real.exists():
         print("Loading real IBM-AML from data/aml/ ...")
-        return aml_data.load_aml(real)
+        df = aml_data.load_aml(real)
+        pat = Path("data/aml/HI-Small_Patterns.txt")
+        if pat.exists():
+            df = aml_data.attach_patterns(df, aml_data.load_patterns(pat))
+            labelled = int((df["pattern"] != "").sum())
+            print(f"  attached {labelled:,} typology labels from the patterns file")
+        return df
     print("Real IBM-AML not found; using the schema-faithful mock (numbers illustrative).")
     return aml_data.load_aml_frame(aml_data.mock_aml_frames(seed=7))
 
