@@ -52,6 +52,9 @@ def parse_queries(text: str) -> dict[str, str]:
 def main() -> None:
     txns = load_txns()  # noqa: F841  (registered into duckdb below)
     con = duckdb.connect()
+    # keep peak memory down on the large real file: allow disk spill and fewer threads.
+    con.execute("PRAGMA preserve_insertion_order=false")
+    con.execute("PRAGMA threads=4")
     con.register("txns", txns)
     queries = parse_queries(SQL_PATH.read_text())
 

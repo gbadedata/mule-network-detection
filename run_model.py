@@ -56,8 +56,8 @@ def main() -> None:
     queue = scoring.account_queue(test_df, test_scores, top=10)
     hit = int(queue["is_laundering_acct"].sum())
     print(f"Top of the account queue ({hit}/10 are laundering accounts):")
-    with pd.option_context("display.max_colwidth", 60, "display.width", 200):
-        print(queue[["priority", "value_moved", "is_laundering_acct", "reasons"]]
+    with pd.option_context("display.max_colwidth", 55, "display.width", 200):
+        print(queue[["priority", "value_moved", "concentration", "is_laundering_acct", "reasons"]]
               .head(10).to_string(index=False))
 
 

@@ -49,9 +49,15 @@ def account_queue(df: pd.DataFrame, scores: np.ndarray, top: int = 50) -> pd.Dat
     q = s.merge(account_risk(df, scores), on="account", how="left")
     q["risk"] = q["risk"].fillna(0.0)
     q["value_moved"] = np.maximum(q["amt_in"], q["amt_out"])
-    q["priority"] = q["risk"] * q["value_moved"]
+    # burst concentration: peak burst over total activity. Near 1 for a mule whose
+    # activity is packed into one window, near 0 for a legit account busy all the time.
+    activity = (q["in_cnt"] + q["out_cnt"]).clip(lower=1)
+    q["concentration"] = np.maximum(q["max_in_burst"], q["max_out_burst"]) / activity
+    # log-dollars, not raw dollars, so a handful of high-throughput accounts do not
+    # dominate purely on size; risk and concentration then carry weight.
+    q["priority"] = q["risk"] * np.log1p(q["value_moved"]) * q["concentration"]
     q = q.sort_values("priority", ascending=False).head(top).reset_index(drop=True)
     q["reasons"] = [_reasons(r) for r in q.itertuples(index=False)]
-    cols = ["account", "priority", "risk", "value_moved", "in_cnt", "out_cnt",
+    cols = ["account", "priority", "risk", "value_moved", "concentration",
             "max_in_burst", "max_out_burst", "is_laundering_acct", "reasons"]
     return q[cols]

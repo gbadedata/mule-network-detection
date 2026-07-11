@@ -96,10 +96,13 @@ def main() -> None:
     scores = model.score(clf, test_df, cols)
 
     a = value_vs_budget(test_df, scores, tag)
-    b = typology_recall(test_df, scores, tag)
     print(f"wrote {a}")
+    b = typology_recall(test_df, scores, tag)
     if b:
         print(f"wrote {b}")
+    else:
+        print("skipped typology figure: no per-typology labels in this data "
+              "(needs HI-Small_Patterns.txt); remove any stale docs/img/typology_recall.png")
 
 
 if __name__ == "__main__":
