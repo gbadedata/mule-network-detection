@@ -8,12 +8,12 @@ and different deployment stories:
    pass-through ratio, and crucially the burst counts (counterparties arriving in a
    short trailing window) that separate a mule hub from a legit account of the same
    total degree. These use no future information, so they are what a real-time monitor
-   could actually score on. This is the graph version of the strictly-before discipline.
+   could score on. This is the graph version of the strictly-before discipline.
 
 2. Retrospective features (`account_summary`) describe an account over a whole window
    for an investigator: peak burst, and a u-turn measure (does an outflow closely match
    money that just arrived). They are not leakage-safe for real-time scoring and are not
-   model inputs; they support the investigation view and the honest evaluation.
+   model inputs; they support the investigation view and the evaluation.
 
 `candidate_networks` surfaces groups to investigate. A real transaction graph is one
 giant weakly connected component, so components of the raw graph are useless. We flag

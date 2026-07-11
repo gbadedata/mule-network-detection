@@ -1,4 +1,4 @@
-"""Train the mule-scoring model and report it honestly.
+"""Train the mule-scoring model and report where it works and where it does not.
 
 Runs on the real IBM-AML data if present at data/aml/HI-Small_Trans.csv, else on the
 schema-faithful mock. Reports transaction PR-AUC, precision/recall and value recovered

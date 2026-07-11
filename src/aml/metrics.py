@@ -1,7 +1,7 @@
-"""Honest evaluation for mule scoring.
+"""Evaluation for mule scoring.
 
 Accuracy is meaningless when 2% of transfers are laundering, so we report precision and
-recall of the alerts an investigator would actually work under a fixed budget, the
+recall of the alerts an investigator would work under a fixed budget, the
 recall broken out per typology (because the model is strong on some and weak on others),
 and the share of laundered value recovered, since a review team cares about money moved,
 not transaction counts.

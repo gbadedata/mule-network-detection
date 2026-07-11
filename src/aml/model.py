@@ -6,8 +6,8 @@ feature-agnostic: it takes a `feature_cols` list, so the same code scores any fe
 set. Laundering is rare, so we weight the positive class rather than resampling.
 
 The point is not a single number. It is that combining the graph-derived signals in one
-model beats every single hand threshold, and that the honest way to read it is per
-typology and by value recovered under an investigation budget, not by accuracy.
+model beats every single hand threshold, and that the way to read it is per typology and
+by value recovered under an investigation budget, not by accuracy.
 """
 
 from __future__ import annotations

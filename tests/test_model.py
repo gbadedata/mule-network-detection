@@ -1,7 +1,7 @@
 """Tests for the supervised layer: split integrity, scoring, and the queue.
 
 Uses a small mock so training is fast. These check the pipeline is sound, not that any
-particular score is achieved; the honest numbers come from real data.
+particular score is achieved; the numbers that matter come from real data.
 """
 
 
