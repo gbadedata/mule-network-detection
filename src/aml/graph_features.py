@@ -4,20 +4,22 @@ Two kinds of feature, kept deliberately separate, because they have different ru
 and different deployment stories:
 
 1. Streaming features (`prior_features`) describe an account's history *strictly
-   before* the current transfer: how many distinct counterparties it has had, how much
-   it has moved, and its pass-through ratio (money forwarded out over money received
-   in). These use no future information, so they are what a real-time monitor could
-   actually score on. This is the graph version of the strictly-before discipline.
+   before* the current transfer: distinct counterparties and amounts so far, its
+   pass-through ratio, and crucially the burst counts (counterparties arriving in a
+   short trailing window) that separate a mule hub from a legit account of the same
+   total degree. These use no future information, so they are what a real-time monitor
+   could actually score on. This is the graph version of the strictly-before discipline.
 
-2. Retrospective features (`account_summary`) describe an account over a whole window,
-   for an investigator triaging surfaced networks after the fact. They are not
-   leakage-safe for real-time scoring and are not used as model inputs; they support
-   the investigation view and the honest evaluation.
+2. Retrospective features (`account_summary`) describe an account over a whole window
+   for an investigator: peak burst, and a u-turn measure (does an outflow closely match
+   money that just arrived). They are not leakage-safe for real-time scoring and are not
+   model inputs; they support the investigation view and the honest evaluation.
 
 `candidate_networks` surfaces groups to investigate. A real transaction graph is one
-giant weakly connected component, so components of the raw graph are useless. We first
-filter to pass-through-heavy accounts (the mule signature) and take components of that
-induced subgraph, which isolates candidate rings.
+giant weakly connected component, so components of the raw graph are useless. We flag
+accounts by typology-specific structure, then take components of the transfers among
+them, plus the ego network of each flagged hub to recover star rings (fan-in, fan-out)
+whose one-shot members have no signature on their own.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ FEATURE_COLS = [
     "src_out_cnt_prior", "src_out_deg_prior", "src_amt_out_prior",
     "dst_in_cnt_prior", "dst_in_deg_prior", "dst_amt_in_prior",
     "dst_amt_out_prior", "dst_passthrough_prior", "amt_to_dst_mean_prior",
+    "dst_in_burst", "src_out_burst", "src_recent_in_ratio",
     "hour",
 ]
 
@@ -61,32 +64,95 @@ def _prior_sum(key: pd.Series, value: np.ndarray) -> np.ndarray:
     return (s.groupby(key.to_numpy()).cumsum().to_numpy() - value)
 
 
-def _prior_inflow_outflow(df: pd.DataFrame):
-    """For each transfer, the receiver's prior total inflow and outflow.
+def _prior_flows(df: pd.DataFrame, window: str = "3D") -> dict[str, np.ndarray]:
+    """Per-transfer flow features for both endpoints, strictly before the transfer.
 
-    Built from a per-account event log so it captures both roles: an account both
-    receives (inflow) and sends (outflow). Strictly-before via a stable sort.
+    Built from a per-account event log: each transfer is one inflow event at the
+    receiver and one outflow event at the sender, so both roles of an account are
+    captured. Returns arrays aligned to df rows:
+
+      dst_cum_in, dst_cum_out   receiver's cumulative inflow / outflow so far
+      dst_in_burst              receiver's inflow COUNT in the trailing window (fan-in)
+      src_out_burst             sender's outflow COUNT in the trailing window (fan-out)
+      src_recent_in             sender's inflow AMOUNT in the trailing window, i.e. money
+                                that just arrived and is now being forwarded (u-turn)
+
+    Windowed values use a per-account searchsorted on sorted timestamps, so they are
+    strictly-before and cheap.
     """
     n = len(df)
+    w = pd.Timedelta(window)
     amt = df["amount"].to_numpy(float)
-    ev = pd.DataFrame({
-        "acct": np.concatenate([df["to_account"].to_numpy(), df["from_account"].to_numpy()]),
-        "ts": np.concatenate([df["ts"].to_numpy(), df["ts"].to_numpy()]),
-        "inflow": np.concatenate([amt, np.zeros(n)]),
-        "outflow": np.concatenate([np.zeros(n), amt]),
-        "is_in": np.concatenate([np.ones(n, bool), np.zeros(n, bool)]),
-        "orig": np.concatenate([np.arange(n), np.arange(n)]),
-    }).sort_values(["acct", "ts"], kind="stable")
-    g = ev.groupby("acct", sort=False)
-    ev["cum_in_prior"] = g["inflow"].cumsum() - ev["inflow"]
-    ev["cum_out_prior"] = g["outflow"].cumsum() - ev["outflow"]
-    rec = ev[ev["is_in"]].set_index("orig")
-    prior_in = rec["cum_in_prior"].reindex(range(n)).to_numpy()
-    prior_out = rec["cum_out_prior"].reindex(range(n)).to_numpy()
-    return prior_in, prior_out
+    acct = np.concatenate([df["to_account"].to_numpy(), df["from_account"].to_numpy()])
+    ts = np.concatenate([df["ts"].to_numpy("datetime64[ns]"),
+                         df["ts"].to_numpy("datetime64[ns]")])
+    inflow = np.concatenate([amt, np.zeros(n)])
+    in_cnt = np.concatenate([np.ones(n), np.zeros(n)])
+    out_cnt = np.concatenate([np.zeros(n), np.ones(n)])
+    outflow = np.concatenate([np.zeros(n), amt])
+    is_in = np.concatenate([np.ones(n, bool), np.zeros(n, bool)])
+    orig = np.concatenate([np.arange(n), np.arange(n)])
+
+    order = np.lexsort((ts, acct))  # by account, then time
+    acct_s, ts_s, is_in_s, orig_s = acct[order], ts[order], is_in[order], orig[order]
+    inflow_s, outflow_s = inflow[order], outflow[order]
+    in_cnt_s, out_cnt_s = in_cnt[order], out_cnt[order]
+
+    cum_in = np.zeros(2 * n)
+    cum_out = np.zeros(2 * n)
+    win_in_amt = np.zeros(2 * n)
+    win_in_cnt = np.zeros(2 * n)
+    win_out_cnt = np.zeros(2 * n)
+
+    bounds = np.flatnonzero(np.r_[True, acct_s[1:] != acct_s[:-1], True])
+    for gi in range(len(bounds) - 1):
+        a, b = bounds[gi], bounds[gi + 1]
+        gts = ts_s[a:b]
+        pos = np.arange(b - a)
+        left = np.searchsorted(gts, gts - w, side="left")
+        pin = np.r_[0.0, np.cumsum(inflow_s[a:b])]
+        pout = np.r_[0.0, np.cumsum(outflow_s[a:b])]
+        pic = np.r_[0.0, np.cumsum(in_cnt_s[a:b])]
+        poc = np.r_[0.0, np.cumsum(out_cnt_s[a:b])]
+        cum_in[a:b] = pin[pos]        # events strictly before this one
+        cum_out[a:b] = pout[pos]
+        win_in_amt[a:b] = pin[pos] - pin[left]
+        win_in_cnt[a:b] = pic[pos] - pic[left]
+        win_out_cnt[a:b] = poc[pos] - poc[left]
+
+    def gather(arr: np.ndarray, want_in: bool) -> np.ndarray:
+        out = np.zeros(n)
+        mask = is_in_s if want_in else ~is_in_s
+        out[orig_s[mask]] = arr[mask]
+        return out
+
+    return {
+        "dst_cum_in": gather(cum_in, True),
+        "dst_cum_out": gather(cum_out, True),
+        "dst_in_burst": gather(win_in_cnt, True),
+        "src_out_burst": gather(win_out_cnt, False),
+        "src_recent_in": gather(win_in_amt, False),
+    }
 
 
-def prior_features(df: pd.DataFrame):
+def _max_burst(df: pd.DataFrame, key_col: str, window: str) -> pd.Series:
+    """Per-account max number of events in any trailing window (inclusive).
+
+    Retrospective, for the investigation view: the peak inflow or outflow burst an
+    account ever showed, which is what separates a fan-in collector from a legit
+    account of the same total degree.
+    """
+    w = pd.Timedelta(window)
+    out: dict[str, int] = {}
+    for key, sub in df[[key_col, "ts"]].sort_values([key_col, "ts"]).groupby(key_col, sort=False):
+        gts = sub["ts"].to_numpy("datetime64[ns]")
+        pos = np.arange(len(gts))
+        left = np.searchsorted(gts, gts - w, side="left")
+        out[key] = int((pos - left + 1).max())
+    return pd.Series(out)
+
+
+def prior_features(df: pd.DataFrame, window: str = "3D"):
     """Return (df_with_features, feature_cols): leakage-safe streaming features."""
     df = df.sort_values("ts").reset_index(drop=True)
     src, dst = df["from_account"], df["to_account"]
@@ -94,7 +160,7 @@ def prior_features(df: pd.DataFrame):
 
     dst_in_cnt = _prior_count(dst)
     dst_amt_in = _prior_sum(dst, amt)
-    dst_in_prior, dst_out_prior = _prior_inflow_outflow(df)
+    f = _prior_flows(df, window=window)
 
     feats = {
         "amount_log": np.log1p(amt),
@@ -104,11 +170,16 @@ def prior_features(df: pd.DataFrame):
         "dst_in_cnt_prior": dst_in_cnt,
         "dst_in_deg_prior": _prior_distinct(dst, src),
         "dst_amt_in_prior": dst_amt_in,
-        "dst_amt_out_prior": dst_out_prior,
+        "dst_amt_out_prior": f["dst_cum_out"],
         # pass-through: money the receiver has already forwarded per unit received.
-        "dst_passthrough_prior": dst_out_prior / (dst_in_prior + 1.0),
+        "dst_passthrough_prior": f["dst_cum_out"] / (f["dst_cum_in"] + 1.0),
         # is this amount a spike versus what the receiver usually takes in?
         "amt_to_dst_mean_prior": amt / (dst_amt_in / np.maximum(dst_in_cnt, 1) + 1.0),
+        # burst: counterparties arriving in a short window separate mules from hubs.
+        "dst_in_burst": f["dst_in_burst"],
+        "src_out_burst": f["src_out_burst"],
+        # u-turn: money that just arrived and is being forwarded on now.
+        "src_recent_in_ratio": f["src_recent_in"] / (amt + 1.0),
         "hour": df["ts"].dt.hour.to_numpy(),
     }
     feat_df = pd.DataFrame(feats, index=df.index).fillna(0.0)
@@ -116,7 +187,7 @@ def prior_features(df: pd.DataFrame):
     return out, list(feat_df.columns)
 
 
-def account_summary(df: pd.DataFrame) -> pd.DataFrame:
+def account_summary(df: pd.DataFrame, window: str = "3D") -> pd.DataFrame:
     """Retrospective per-account structure over the window (investigation + eval)."""
     out_g = df.groupby("from_account")
     in_g = df.groupby("to_account")
@@ -127,12 +198,26 @@ def account_summary(df: pd.DataFrame) -> pd.DataFrame:
     s["in_cnt"] = in_g.size().reindex(accts).fillna(0)
     s["distinct_out"] = out_g["to_account"].nunique().reindex(accts).fillna(0)
     s["distinct_in"] = in_g["from_account"].nunique().reindex(accts).fillna(0)
+    s["max_in_burst"] = _max_burst(df, "to_account", window).reindex(accts).fillna(0)
+    s["max_out_burst"] = _max_burst(df, "from_account", window).reindex(accts).fillna(0)
     s["amt_out"] = out_g["amount"].sum().reindex(accts).fillna(0.0)
     s["amt_in"] = in_g["amount"].sum().reindex(accts).fillna(0.0)
     hi = np.maximum(s["amt_in"], s["amt_out"])
     s["passthrough"] = np.minimum(s["amt_in"], s["amt_out"]) / hi.replace(0, np.nan)
     s["passthrough"] = s["passthrough"].fillna(0.0)
     s["net_flow"] = s["amt_in"] - s["amt_out"]
+
+    # u-turn: does an outflow closely match money that just arrived? We score the
+    # amount match between this outflow and the account's recent inflow, near 1 when
+    # they are similar and low when they differ. High for chain and scatter
+    # intermediaries that forward what they received, low for accounts whose in and out
+    # happen at unrelated times and amounts, which static balance cannot tell apart.
+    flows = _prior_flows(df, window=window)
+    amt = df["amount"].to_numpy(float)
+    recent_in = flows["src_recent_in"]
+    match = np.minimum(recent_in, amt) / np.maximum(np.maximum(recent_in, amt), 1.0)
+    rp = pd.Series(match, index=df["from_account"].to_numpy()).groupby(level=0).max()
+    s["rapid_passthrough"] = rp.reindex(accts).fillna(0.0)
 
     laund = pd.concat([
         df[["from_account", "is_laundering"]].rename(columns={"from_account": "account"}),
@@ -144,7 +229,7 @@ def account_summary(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def structural_flags(df: pd.DataFrame, fan_pct: float = 98.0,
-                     min_passthrough: float = 0.7) -> pd.DataFrame:
+                     min_rapid: float = 0.85) -> pd.DataFrame:
     """Flag accounts by typology-specific structure, since no single rule fits all.
 
     A collector shows fan-in (many distinct senders), a distributor shows fan-out
@@ -154,19 +239,20 @@ def structural_flags(df: pd.DataFrame, fan_pct: float = 98.0,
     is what the supervised model is for.
     """
     s = account_summary(df)
-    din, dout = s["distinct_in"].to_numpy(float), s["distinct_out"].to_numpy(float)
-    in_hi = np.percentile(din[din > 0], fan_pct) if (din > 0).any() else np.inf
-    out_hi = np.percentile(dout[dout > 0], fan_pct) if (dout > 0).any() else np.inf
-    s["fan_in_flag"] = (din >= in_hi).astype(int)
-    s["fan_out_flag"] = (dout >= out_hi).astype(int)
-    s["passthrough_flag"] = ((s["passthrough"] >= min_passthrough)
-                             & (din >= 1) & (dout >= 1)).astype(int)
+    bin_, bout = s["max_in_burst"].to_numpy(float), s["max_out_burst"].to_numpy(float)
+    # burst peaks, not total degree: a collector and a legit account can have the same
+    # number of counterparties, but the collector packs them into a short window.
+    in_hi = np.percentile(bin_[bin_ > 0], fan_pct) if (bin_ > 0).any() else np.inf
+    out_hi = np.percentile(bout[bout > 0], fan_pct) if (bout > 0).any() else np.inf
+    s["fan_in_flag"] = ((bin_ >= in_hi) & (bin_ >= 4)).astype(int)
+    s["fan_out_flag"] = ((bout >= out_hi) & (bout >= 4)).astype(int)
+    s["passthrough_flag"] = (s["rapid_passthrough"] >= min_rapid).astype(int)
     s["flagged"] = ((s["fan_in_flag"] + s["fan_out_flag"] + s["passthrough_flag"]) > 0).astype(int)
     return s
 
 
 def candidate_networks(df: pd.DataFrame, fan_pct: float = 98.0,
-                       min_passthrough: float = 0.7) -> pd.DataFrame:
+                       min_rapid: float = 0.85) -> pd.DataFrame:
     """Surface candidate mule networks as components of the flagged subgraph.
 
     The raw graph is one giant component, so we keep transfers where either endpoint
@@ -174,13 +260,17 @@ def candidate_networks(df: pd.DataFrame, fan_pct: float = 98.0,
     Returns one row per component with size and, for evaluation, its share of
     laundering.
     """
-    s = structural_flags(df, fan_pct=fan_pct, min_passthrough=min_passthrough)
+    s = structural_flags(df, fan_pct=fan_pct, min_rapid=min_rapid)
     flagged = set(s.loc[s["flagged"] == 1, "account"])
+    hubs = set(s.loc[(s["fan_in_flag"] == 1) | (s["fan_out_flag"] == 1), "account"])
 
-    # Both endpoints flagged keeps surfaced rings tight and high-precision on the
-    # wired typologies (chains, cycles, scatter-gather). Fan-in and fan-out endpoints
-    # need the burst-rate features that come next; they are not reliably caught here.
-    sub = df[df["from_account"].isin(flagged) & df["to_account"].isin(flagged)]
+    # Two kinds of ring. Wired typologies (chains, cycles, scatter-gather) show up as
+    # transfers where both endpoints are flagged. Star typologies (fan-in, fan-out)
+    # have a detectable hub and many one-shot counterparties that are invisible alone,
+    # so we pull in the hub's ego network to recover the whole ring.
+    both = df["from_account"].isin(flagged) & df["to_account"].isin(flagged)
+    hub_edge = df["from_account"].isin(hubs) | df["to_account"].isin(hubs)
+    sub = df[both | hub_edge]
     g = nx.from_pandas_edgelist(sub, "from_account", "to_account",
                                 create_using=nx.DiGraph())
     comps = list(nx.weakly_connected_components(g))

@@ -34,40 +34,38 @@ def main() -> None:
     feat, cols = graph_features.prior_features(df)
     print(f"Leakage-safe streaming features: {len(cols)} (no future information).")
     gp = feat.groupby("is_laundering")
-    indeg = gp["dst_in_deg_prior"].mean()
-    spike = gp["amt_to_dst_mean_prior"].mean()
-    print("  mean receiver in-degree-so-far   legit vs laundering: "
-          f"{indeg.get(0, float('nan')):.2f} vs {indeg.get(1, float('nan')):.2f}")
-    print("  mean amount vs receiver's usual   legit vs laundering: "
-          f"{spike.get(0, float('nan')):.2f} vs {spike.get(1, float('nan')):.2f}\n")
+    for name, col in [("in-burst (fan-in)", "dst_in_burst"),
+                      ("out-burst (fan-out)", "src_out_burst"),
+                      ("amount vs usual (spike)", "amt_to_dst_mean_prior")]:
+        m = gp[col].mean()
+        print(f"  {name:24s} legit {m.get(0, float('nan')):.2f} vs "
+              f"laundering {m.get(1, float('nan')):.2f}")
+    print()
 
     if "pattern" in df.columns:
         s = graph_features.structural_flags(df)
-        cols3 = ["pattern", "is_laundering"]
-        laund = pd.concat([
-            df[["from_account", *cols3]].rename(columns={"from_account": "account"}),
-            df[["to_account", *cols3]].rename(columns={"to_account": "account"}),
-        ])
-        laund = laund[laund["is_laundering"] == 1]
-        dom = laund.groupby("account")["pattern"].agg(lambda x: x.value_counts().index[0])
         flag = dict(zip(s["account"], s["flagged"], strict=False))
-        print("Structural flags catch some typologies and miss others (the honest finding):")
-        by_pat: dict[str, list[int]] = {}
-        for acct, pat in dom.items():
-            by_pat.setdefault(pat, [0, 0])
-            by_pat[pat][0] += int(flag.get(acct, 0))
-            by_pat[pat][1] += 1
-        for pat, (c, t) in sorted(by_pat.items()):
-            print(f"  {pat:16s} {c:4d}/{t:<4d} = {c / t:.0%}")
-        print("  fan-in and fan-out endpoints look like ordinary accounts by degree "
-              "alone; they need burst-rate features (next).\n")
+        collectors = set(df.loc[df["pattern"] == "fan_in", "to_account"])
+        distributors = set(df.loc[df["pattern"] == "fan_out", "from_account"])
+        c_hit = sum(flag.get(a, 0) for a in collectors)
+        d_hit = sum(flag.get(a, 0) for a in distributors)
+        print("Burst features detect the hub of every star ring:")
+        print(f"  fan-in collectors caught    {c_hit}/{len(collectors)}")
+        print(f"  fan-out distributors caught {d_hit}/{len(distributors)}")
+        print("  the one-shot senders around a hub have no signature alone; they are "
+              "recovered\n  by expanding the hub's ego network.\n")
 
     nets = graph_features.candidate_networks(df)
-    tight = nets[nets["laundering_share"] >= 0.9]
-    print(f"Candidate rings surfaced (weakly connected components of flagged accounts): "
-          f"{len(nets)}")
-    print(f"  {len(tight)} are >=90% laundering; the model's job is to raise recall on "
-          "the confounded typologies.")
+    tot = int(graph_features.account_summary(df)["is_laundering_acct"].sum())
+    caught = int(nets["laundering_accounts"].sum())
+    rings = nets[nets["accounts"] < 100]
+    clean = rings[rings["laundering_share"] >= 0.8]
+    print(f"Candidate networks surfaced: {len(nets)} "
+          f"({caught}/{tot} laundering accounts inside them).")
+    print(f"  {len(clean)} are small rings that are >=80% laundering.")
+    print("  Single structural thresholds are high-recall but low-precision here: no one "
+          "rule\n  separates every typology. Combining these features in a supervised, "
+          "typology-aware\n  model is the next step, and where precision comes from.")
 
 
 if __name__ == "__main__":

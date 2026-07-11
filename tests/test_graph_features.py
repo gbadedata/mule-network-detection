@@ -91,3 +91,30 @@ def test_loader_normalises_columns():
     for col in ["ts", "from_account", "to_account", "amount", "is_laundering"]:
         assert col in df.columns
     assert df["ts"].is_monotonic_increasing
+
+
+def test_in_burst_counts_recent_arrivals():
+    base = pd.Timestamp("2022-09-01")
+    rows = [("B", "A", 0), ("C", "A", 1), ("D", "A", 2)]  # three arrivals to A, minutes apart
+    df = pd.DataFrame({
+        "ts": [base + pd.Timedelta(minutes=m) for *_, m in rows],
+        "from_account": [r[0] for r in rows],
+        "to_account": [r[1] for r in rows],
+        "amount": [100.0, 100.0, 100.0],
+        "is_laundering": [0, 0, 0],
+    })
+    f, _ = graph_features.prior_features(df, window="3D")
+    f = f.sort_values("ts").reset_index(drop=True)
+    # strictly-before inflow counts to A within the window: 0, then 1, then 2
+    assert f["dst_in_burst"].tolist() == [0, 1, 2]
+
+
+def test_burst_flags_catch_fan_in_and_fan_out_hubs():
+    df = aml_data.load_aml_frame(aml_data.mock_aml_frames(seed=7))
+    s = graph_features.structural_flags(df)
+    flag = dict(zip(s["account"], s["flagged"], strict=False))
+    collectors = set(df.loc[df["pattern"] == "fan_in", "to_account"])
+    distributors = set(df.loc[df["pattern"] == "fan_out", "from_account"])
+    # the burst signal should catch essentially every star hub
+    assert sum(flag.get(a, 0) for a in collectors) >= 0.9 * len(collectors)
+    assert sum(flag.get(a, 0) for a in distributors) >= 0.9 * len(distributors)
