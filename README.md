@@ -47,13 +47,30 @@ counterparties in a short window) and the amount pattern, not raw degree. That i
 case for a supervised model over multiple weak signals rather than one hand-tuned
 threshold, and it is what comes next.
 
+## Scoring and the investigation queue
+
+A gradient-boosted model scores each transfer using the leakage-safe streaming features,
+trained on a time split so it never sees the future. Because those features carry each
+account's network context (burst, pass-through, degree), this is network-aware
+transaction scoring rather than isolated-row scoring, which is the whole point at a base
+rate this low. Transaction scores aggregate to account risk, and `account_queue` ranks
+accounts by expected laundered value (risk times money moved) with plain-language reason
+codes, so each alert explains itself ("fans out: 14 outflows in a short window").
+
+Evaluation is deliberately honest: transaction PR-AUC, precision and recall and value
+recovered under a fixed investigation budget, and recall broken out per typology, since
+the model is strong on some and weak on others. On the mock the scores are high because
+the injected typologies are cleanly separable; that is a property of synthetic data, not
+a claim about production. The numbers that matter come from running on the real IBM data.
+
 ## Quickstart
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-make test          # includes the no-lookahead guard
-python run_demo.py # runs on the mock; drop the real CSV in data/aml/ to use it
+make test           # includes the no-lookahead guard
+python run_demo.py  # graph, features, and network surfacing
+python run_model.py # train, evaluate honestly, and print the account queue
 ```
 
 Data download instructions are in [`data/aml/README.md`](data/aml/README.md). Raw CSVs
